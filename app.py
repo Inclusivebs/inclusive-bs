@@ -13,9 +13,10 @@ from streamlit_folium import st_folium
 # Konfiguration & Konstanten
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Inclusive BS - Barrierefreiheits-Guide Braunschweig",
+    page_title="Inclusive BS – Barrierefreiheits-Guide TU Braunschweig",
     page_icon="♿",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
 # Supabase & Admin Zugangsdaten aus Streamlit Secrets laden
@@ -45,6 +46,14 @@ KATEGORIEN = [
     "Ruheort",
     "Sonstiges Hindernis"
 ]
+
+KATEGORIE_ICONS_TEXT = {
+    "Rollstuhlgerecht / Rampe": "♿ Rollstuhlgerecht / Rampe",
+    "Aufzug defekt / außer Betrieb": "🚨 Aufzug defekt / außer Betrieb",
+    "Auditive / Visuelle Hilfe": "🔊 Auditive / Visuelle Hilfe",
+    "Ruheort": "🌿 Ruheort",
+    "Sonstiges Hindernis": "⚠️ Sonstiges Hindernis"
+}
 
 STATUS_OPTIONEN = [
     "Gemeldet",
@@ -145,7 +154,7 @@ def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
 
 def load_data() -> list:
     """Lädt alle gespeicherten Punkte aus der Supabase-Datenbank."""
-    url = f"{SUPABASE_URL}/rest/v1/punkte?select=*&order=id.asc"
+    url = f"{SUPABASE_URL}/rest/v1/punkte?select=*&order=id.desc"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=10)
         if resp.status_code == 200:
@@ -235,6 +244,9 @@ if "selected_lat" not in st.session_state:
 if "selected_lon" not in st.session_state:
     st.session_state.selected_lon = BS_CENTER_LON
 
+if "selected_location_label" not in st.session_state:
+    st.session_state.selected_location_label = "Campus-Zentrum (TU Braunschweig)"
+
 if "map_center" not in st.session_state:
     st.session_state.map_center = [BS_CENTER_LAT, BS_CENTER_LON]
 
@@ -247,6 +259,9 @@ if "last_preset" not in st.session_state:
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 
+if "min_confirmations" not in st.session_state:
+    st.session_state.min_confirmations = DEFAULT_REQUIRED_CONFIRMATIONS
+
 if "last_submit_ts" not in st.session_state:
     st.session_state.last_submit_ts = 0.0
 
@@ -254,379 +269,532 @@ if "feedback_banner" not in st.session_state:
     st.session_state.feedback_banner = None
 
 all_points = load_data()
+min_confirmations = st.session_state.min_confirmations if st.session_state.is_admin else DEFAULT_REQUIRED_CONFIRMATIONS
+
+all_verified = [p for p in all_points if p.get("bestaetigungen", 1) >= min_confirmations]
+all_unverified = [p for p in all_points if p.get("bestaetigungen", 1) < min_confirmations]
+active_issues = [
+    p for p in all_verified
+    if p["Kategorie"] in ("Aufzug defekt / außer Betrieb", "Sonstiges Hindernis")
+    and p["Status"] != "Behoben / Barrierefrei"
+]
+overall_avg = (
+    round(sum(get_avg_rating(p) for p in all_verified) / len(all_verified), 1)
+    if all_verified else 0.0
+)
 
 # -----------------------------------------------------------------------------
-# UI: Kopfbereich & Feedback-Banner
+# UI: Kompakter Header & Kennzahlen-Leiste
 # -----------------------------------------------------------------------------
-st.title("♿ Inclusive BS – Barrierefreiheits-Guide TU Braunschweig")
-st.markdown(
-    "Melde barrierefreie Zugänge, defekte Aufzüge, Ruheorte oder Hindernisse rund um den Campus. "
-    "**Tipp:** Klicke direkt auf eine Stelle in der Karte – die Koordinaten werden automatisch ins Formular übernommen "
-    "*(📱 am Smartphone: tippe oben links auf **`>`**, um das Meldeformular zu öffnen)*."
-)
+header_left, header_right = st.columns([4, 1])
+with header_left:
+    st.title("♿ Inclusive BS")
+    st.caption("Barrierefreiheits-Guide & Campus-Meldeplattform für die TU Braunschweig")
+with header_right:
+    if st.session_state.is_admin:
+        st.success("🛡️ Admin aktiv")
 
 if st.session_state.feedback_banner:
     st.success(st.session_state.feedback_banner)
     st.session_state.feedback_banner = None
 
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("✅ Verifizierte Orte", len(all_verified))
+m2.metric("⏳ Offene Meldungen", len(all_unverified))
+m3.metric("⚠️ Aktive Störungen", len(active_issues))
+m4.metric("⭐ Ø Campus-Bewertung", f"{overall_avg:.1f} / 5" if all_verified else "–")
+
 # -----------------------------------------------------------------------------
-# UI: Sidebar – Eingabemaske & Admin-Zugang
+# UI: Haupt-Navigation über 4 aufgeräumte Tabs
 # -----------------------------------------------------------------------------
-with st.sidebar:
-    st.header("📍 Neuen Punkt melden")
+tab_map, tab_report, tab_queue, tab_about = st.tabs([
+    "🗺️ Campus-Karte & Orte",
+    "➕ Ort melden",
+    f"⏳ Mithelfen & Bestätigen ({len(all_unverified)})",
+    "ℹ️ Über das Projekt & Admin"
+])
 
-    preset_options = ["Per Klick auf Karte wählen"] + [b["name"] for b in TU_CAMPUS_PINS]
-    selected_preset = st.selectbox("Gebäude-Schnellauswahl:", options=preset_options)
-
-    if selected_preset != st.session_state.last_preset:
-        st.session_state.last_preset = selected_preset
-        if selected_preset != "Per Klick auf Karte wählen":
-            chosen_building = next(b for b in TU_CAMPUS_PINS if b["name"] == selected_preset)
-            st.session_state.selected_lat = chosen_building["lat"]
-            st.session_state.selected_lon = chosen_building["lon"]
-            st.session_state.map_center = [chosen_building["lat"], chosen_building["lon"]]
-
-    st.info(f"📌 Gewählte Position:\n**Lat:** `{st.session_state.selected_lat:.6f}` | **Lon:** `{st.session_state.selected_lon:.6f}`")
-
-    with st.form("add_point_form", clear_on_submit=True):
-        titel = st.text_input(
-            "Titel / Ort *",
-            placeholder='z. B. "Audimax - Rampe Haupteingang"'
+# =============================================================================
+# TAB 1: INTERAKTIVE KARTE & VERIFIZIERTE ORTE
+# =============================================================================
+with tab_map:
+    search_col, filter_btn_col = st.columns([3, 1])
+    with search_col:
+        search_query = st.text_input(
+            "Suche",
+            placeholder="🔍 Nach Gebäude, Hörsaal, Rampe oder Stichwort suchen (z. B. Audimax, UB, Aufzug)...",
+            label_visibility="collapsed"
         )
-        kategorie = st.selectbox("Kategorie *", options=KATEGORIEN)
-        status = st.selectbox("Status *", options=STATUS_OPTIONEN)
+    with filter_btn_col:
+        show_unverified_on_map = st.toggle("Unbestätigte grau zeigen", value=False)
 
-        bewertung = st.slider(
-            "Qualitäts-Bewertung (1 = schlecht, 5 = sehr gut)",
-            min_value=1,
-            max_value=5,
-            value=4
-        )
-        ausgewaehlte_tags = st.multiselect(
-            "Eigenschaften / Tags (optional):",
-            options=BEWERTUNGS_TAGS
-        )
-        beschreibung = st.text_area(
-            "Detailbeschreibung *",
-            placeholder="Beschreibe die Situation vor Ort (z. B. Etage, Eingang, Türbreite)..."
-        )
-
-        coord_key = f"{st.session_state.selected_lat}_{st.session_state.selected_lon}"
-        col_lat, col_lon = st.columns(2)
-        with col_lat:
-            lat = st.number_input(
-                "Breitengrad (Lat)",
-                value=float(st.session_state.selected_lat),
-                format="%.6f",
-                step=0.0001,
-                key=f"lat_{coord_key}"
+    with st.expander("🎛️ Filter nach Kategorie & Status anpassen", expanded=False):
+        f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
+        with f_col1:
+            selected_kategorien = st.multiselect(
+                "Kategorien:",
+                options=KATEGORIEN,
+                default=KATEGORIEN
             )
-        with col_lon:
-            lon = st.number_input(
-                "Längengrad (Lon)",
-                value=float(st.session_state.selected_lon),
-                format="%.6f",
-                step=0.0001,
-                key=f"lon_{coord_key}"
+        with f_col2:
+            selected_status = st.multiselect(
+                "Status:",
+                options=STATUS_OPTIONEN,
+                default=STATUS_OPTIONEN
+            )
+        with f_col3:
+            st.write("")
+            show_tu_pins = st.checkbox("🏛️ TU-Gebäude", value=True)
+
+    query_lower = search_query.strip().lower()
+    matching_points = [
+        p for p in all_points
+        if p["Kategorie"] in selected_kategorien
+        and p["Status"] in selected_status
+        and (
+            not query_lower
+            or query_lower in p["Titel"].lower()
+            or query_lower in p["Beschreibung"].lower()
+            or query_lower in p["Kategorie"].lower()
+            or any(query_lower in t.lower() for t in p.get("tags", []))
+        )
+    ]
+
+    verified_points = [p for p in matching_points if p.get("bestaetigungen", 1) >= min_confirmations]
+    unverified_points = [p for p in matching_points if p.get("bestaetigungen", 1) < min_confirmations]
+    points_for_map = verified_points + (unverified_points if show_unverified_on_map else [])
+
+    # Karte rendern
+    m = folium.Map(
+        location=st.session_state.map_center,
+        zoom_start=st.session_state.map_zoom,
+        tiles="OpenStreetMap"
+    )
+
+    if show_tu_pins:
+        tu_group = folium.FeatureGroup(name="TU Braunschweig Gebäude")
+        for b in TU_CAMPUS_PINS:
+            folium.Marker(
+                location=[b["lat"], b["lon"]],
+                popup=f"<b>{b['name']}</b><br>{b['adresse']}",
+                tooltip=f"🏛️ {b['name']}",
+                icon=folium.Icon(color="darkred", icon="university", prefix="fa")
+            ).add_to(tu_group)
+        tu_group.add_to(m)
+
+    for punkt in points_for_map:
+        is_verified = punkt.get("bestaetigungen", 1) >= min_confirmations
+        marker_color = get_marker_color(punkt["Kategorie"], punkt["Status"], is_verified)
+        icon_name = KATEGORIE_STYLES.get(punkt["Kategorie"], {}).get("icon", "info-sign")
+
+        avg_rating = get_avg_rating(punkt)
+        stars_str = format_stars(avg_rating)
+        tags_html = ", ".join(punkt.get("tags", [])) or "Keine Tags"
+        badge = (
+            "<span style='color:green; font-weight:bold;'>✔ Verifiziert</span>"
+            if is_verified
+            else f"<span style='color:gray;'>⏳ Unbestätigt ({punkt['bestaetigungen']}/{min_confirmations})</span>"
+        )
+        if punkt.get("offiziell"):
+            badge += " | <span style='color:#BE1E3C; font-weight:bold;'>🛡️ Offiziell</span>"
+
+        popup_html = f"""
+        <div style="font-family: sans-serif; min-width: 230px;">
+            <h4 style="margin: 0 0 4px 0;">{punkt['Titel']}</h4>
+            <div style="margin-bottom: 6px; font-size: 12px;">{badge}</div>
+            <p style="margin: 2px 0;"><b>Bewertung:</b> {stars_str} ({len(punkt.get('bewertungen', []))}x)</p>
+            <p style="margin: 2px 0;"><b>Kategorie:</b> {punkt['Kategorie']}</p>
+            <p style="margin: 2px 0;"><b>Status:</b> {punkt['Status']}</p>
+            <p style="margin: 2px 0;"><b>Tags:</b> {tags_html}</p>
+            <p style="margin: 6px 0 0 0;">{punkt['Beschreibung']}</p>
+            <hr style="margin: 6px 0;">
+            <small style="color: gray;">Bestätigungen: {punkt['bestaetigungen']} | Erfasst: {punkt['Erstellt am']}</small>
+        </div>
+        """
+
+        folium.Marker(
+            location=[punkt["Breitengrad"], punkt["Längengrad"]],
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=f"{punkt['Titel']} | {stars_str}",
+            icon=folium.Icon(color=marker_color, icon=icon_name, prefix="fa")
+        ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+
+    st_folium(
+        m,
+        width="100%",
+        height=480,
+        key="inclusive_bs_main_map",
+        returned_objects=[]
+    )
+
+    st.caption(
+        "**Legende:** 🟢 Barrierefrei / Behoben · 🔴 Aufzug defekt · 🔵 Auditive/Visuelle Hilfe · "
+        "🟣 Ruheort · 🟠 Hindernis · ⏳ In Prüfung (Hellblau) · 🏛️ TU-Gebäude (Dunkelrot)"
+    )
+
+    st.subheader(f"📍 Verifizierte Campus-Orte ({len(verified_points)})")
+    if verified_points:
+        for p in verified_points:
+            with st.container(border=True):
+                top_l, top_r = st.columns([3.5, 1.5])
+                with top_l:
+                    title_suffix = " · 🛡️ **Offiziell**" if p.get("offiziell") else ""
+                    st.markdown(f"#### {p['Titel']}{title_suffix}")
+                    kat_label = KATEGORIE_ICONS_TEXT.get(p["Kategorie"], p["Kategorie"])
+                    st.caption(
+                        f"{kat_label} · **Status:** {p['Status']} · "
+                        f"**Bewertung:** {format_stars(get_avg_rating(p))} ({p['bestaetigungen']} Bestätigungen)"
+                    )
+                with top_r:
+                    st.caption(f"🕒 {p['Erstellt am']}")
+                    if p.get("tags"):
+                        st.caption("🏷️ " + ", ".join(p["tags"]))
+
+                st.write(p["Beschreibung"])
+    else:
+        st.info(
+            "Keine passenden verifizierten Punkte gefunden. "
+            "Passe deine Suche/Filter an oder hilf im Tab **„⏳ Mithelfen & Bestätigen“**, offene Meldungen freizuschalten!"
+        )
+
+# =============================================================================
+# TAB 2: NEUES HINDERNIS ODER ZUGANG MELDEN
+# =============================================================================
+with tab_report:
+    st.subheader("📍 Neuen Zugang, Ruheort oder Barriere melden")
+    st.markdown(
+        "Wähle rechts ein **TU-Gebäude** aus oder klicke direkt auf die exakte Stelle auf der Karte – "
+        "fülle anschließend links das kurze Formular aus."
+    )
+
+    form_col, picker_col = st.columns([1.2, 1])
+
+    with picker_col:
+        preset_options = ["Per Klick auf Karte wählen"] + [b["name"] for b in TU_CAMPUS_PINS]
+        selected_preset = st.selectbox("🏛️ Gebäude-Schnellauswahl:", options=preset_options)
+
+        if selected_preset != st.session_state.last_preset:
+            st.session_state.last_preset = selected_preset
+            if selected_preset != "Per Klick auf Karte wählen":
+                chosen_building = next(b for b in TU_CAMPUS_PINS if b["name"] == selected_preset)
+                st.session_state.selected_lat = chosen_building["lat"]
+                st.session_state.selected_lon = chosen_building["lon"]
+                st.session_state.selected_location_label = f"{chosen_building['name']} ({chosen_building['adresse']})"
+                st.session_state.map_center = [chosen_building["lat"], chosen_building["lon"]]
+
+        st.info(f"📌 **Ausgewählter Standort:** {st.session_state.selected_location_label}")
+
+        picker_map = folium.Map(
+            location=st.session_state.map_center,
+            zoom_start=17,
+            tiles="OpenStreetMap"
+        )
+        for b in TU_CAMPUS_PINS:
+            folium.Marker(
+                location=[b["lat"], b["lon"]],
+                tooltip=f"🏛️ {b['name']}",
+                icon=folium.Icon(color="darkred", icon="university", prefix="fa")
+            ).add_to(picker_map)
+
+        folium.Marker(
+            location=[st.session_state.selected_lat, st.session_state.selected_lon],
+            tooltip="Gewählter Standort für deine Meldung",
+            icon=folium.Icon(color="blue", icon="map-pin", prefix="fa")
+        ).add_to(picker_map)
+
+        picker_data = st_folium(
+            picker_map,
+            width="100%",
+            height=360,
+            key="inclusive_bs_picker_map",
+            returned_objects=["last_clicked"]
+        )
+
+        if picker_data and picker_data.get("last_clicked"):
+            clicked_lat = round(picker_data["last_clicked"]["lat"], 6)
+            clicked_lon = round(picker_data["last_clicked"]["lng"], 6)
+            if (
+                clicked_lat != round(st.session_state.selected_lat, 6)
+                or clicked_lon != round(st.session_state.selected_lon, 6)
+            ):
+                st.session_state.selected_lat = clicked_lat
+                st.session_state.selected_lon = clicked_lon
+                st.session_state.selected_location_label = f"Kartenpunkt ({clicked_lat:.5f}, {clicked_lon:.5f})"
+                st.session_state.map_center = [clicked_lat, clicked_lon]
+                st.rerun()
+
+    with form_col:
+        with st.form("add_point_form", clear_on_submit=True):
+            titel = st.text_input(
+                "Titel / genauer Ort *",
+                placeholder='z. B. "Audimax – Rampe Haupteingang" oder "UB – Aufzug Nord"'
+            )
+            kategorie = st.selectbox(
+                "Kategorie *",
+                options=KATEGORIEN,
+                format_func=lambda k: KATEGORIE_ICONS_TEXT.get(k, k)
+            )
+            status = st.selectbox("Aktueller Status *", options=STATUS_OPTIONEN)
+
+            bewertung = st.slider(
+                "Qualitäts-Bewertung (1 = unzugänglich / schlecht, 5 = vorbildlich)",
+                min_value=1,
+                max_value=5,
+                value=4
+            )
+            ausgewaehlte_tags = st.multiselect(
+                "Eigenschaften / Tags (optional):",
+                options=BEWERTUNGS_TAGS
+            )
+            beschreibung = st.text_area(
+                "Detailbeschreibung *",
+                placeholder="Beschreibe die Situation vor Ort (z. B. Etage, Eingang, Türbreite, Umweg)...",
+                height=110
             )
 
-        if st.session_state.is_admin:
-            offizieller_partner = st.checkbox(
-                "🛡️ Als offizieller Partner melden (sofort auf der Karte sichtbar)",
+            lat = float(st.session_state.selected_lat)
+            lon = float(st.session_state.selected_lon)
+
+            if st.session_state.is_admin:
+                offizieller_partner = st.checkbox(
+                    "🛡️ Als offizieller Partner melden (sofort auf der Karte sichtbar)",
+                    value=True
+                )
+            else:
+                offizieller_partner = False
+
+            enable_clustering = st.checkbox(
+                "🔗 Nahegelegene Meldungen (< 10m) automatisch zusammenfassen",
                 value=True
             )
-        else:
-            offizieller_partner = False
 
-        enable_clustering = st.checkbox(
-            "🔗 Nahegelegene Meldungen (< 10m) zusammenfassen",
-            value=True
-        )
+            submitted = st.form_submit_button("✅ Meldung absenden", type="primary", use_container_width=True)
 
-        submitted = st.form_submit_button("✅ Meldung absenden", use_container_width=True)
+            if submitted:
+                now = time.time()
+                seconds_since_last = now - st.session_state.last_submit_ts
 
-        if submitted:
-            now = time.time()
-            seconds_since_last = now - st.session_state.last_submit_ts
+                if not titel.strip():
+                    st.error("Bitte gib einen Titel oder Ort an.")
+                elif not beschreibung.strip():
+                    st.error("Bitte füge eine kurze Detailbeschreibung hinzu.")
+                elif not st.session_state.is_admin and seconds_since_last < SUBMIT_COOLDOWN_SECONDS:
+                    wait_sec = int(SUBMIT_COOLDOWN_SECONDS - seconds_since_last)
+                    st.warning(f"Bitte warte noch {wait_sec} Sekunden, bevor du eine weitere Meldung absendest.")
+                else:
+                    existing_match = None
+                    if enable_clustering:
+                        for p in all_points:
+                            if p.get("offiziell") and not st.session_state.is_admin:
+                                continue
+                            dist = haversine_meters(lat, lon, p["Breitengrad"], p["Längengrad"])
+                            if dist <= CLUSTER_RADIUS_METERS and p["Kategorie"] == kategorie:
+                                existing_match = p
+                                break
 
-            if not titel.strip():
-                st.error("Bitte gib einen Titel oder Ort an.")
-            elif not beschreibung.strip():
-                st.error("Bitte füge eine kurze Detailbeschreibung hinzu.")
-            elif not st.session_state.is_admin and seconds_since_last < SUBMIT_COOLDOWN_SECONDS:
-                wait_sec = int(SUBMIT_COOLDOWN_SECONDS - seconds_since_last)
-                st.warning(f"Bitte warte noch {wait_sec} Sekunden, bevor du eine weitere Meldung absendest.")
-            else:
-                existing_match = None
-                if enable_clustering:
-                    for p in all_points:
-                        # Offizielle Admin-Pins sind vor Überschreiben durch Gäste geschützt
-                        if p.get("offiziell") and not st.session_state.is_admin:
-                            continue
-                        dist = haversine_meters(lat, lon, p["Breitengrad"], p["Längengrad"])
-                        if dist <= CLUSTER_RADIUS_METERS and p["Kategorie"] == kategorie:
-                            existing_match = p
-                            break
+                    punkte_zuwachs = DEFAULT_REQUIRED_CONFIRMATIONS if offizieller_partner else 1
 
-                punkte_zuwachs = DEFAULT_REQUIRED_CONFIRMATIONS if offizieller_partner else 1
-
-                if existing_match:
-                    existing_voters = existing_match.get("voter_ids", [])
-                    if not st.session_state.is_admin and device_id in existing_voters:
-                        st.warning(
-                            f"Du hast den bestehenden Punkt **„{existing_match['Titel']}“** an dieser Stelle bereits gemeldet oder bestätigt."
-                        )
-                    else:
-                        new_ratings = existing_match["bewertungen"] + [bewertung]
-                        new_tags = list(dict.fromkeys(existing_match["tags"] + ausgewaehlte_tags))
-                        new_desc = existing_match["Beschreibung"]
-                        if beschreibung.strip() not in new_desc:
-                            new_desc += f" | Ergänzung: {beschreibung.strip()}"
-                        updated_voters = list(dict.fromkeys(existing_voters + [device_id]))
-                        new_total = existing_match["bestaetigungen"] + punkte_zuwachs
-
-                        if update_point(existing_match["id"], {
-                            "bestaetigungen": new_total,
-                            "bewertungen": new_ratings,
-                            "tags": new_tags,
-                            "beschreibung": new_desc,
-                            "offiziell": existing_match["offiziell"] or offizieller_partner,
-                            "voter_ids": updated_voters
-                        }):
-                            st.session_state.last_submit_ts = now
-                            st.session_state.feedback_banner = (
-                                f"✅ Deine Ergänzung wurde mit dem bestehenden Punkt „{existing_match['Titel']}“ "
-                                f"zusammengeführt ({new_total}/{DEFAULT_REQUIRED_CONFIRMATIONS} Bestätigungen)."
+                    if existing_match:
+                        existing_voters = existing_match.get("voter_ids", [])
+                        if not st.session_state.is_admin and device_id in existing_voters:
+                            st.warning(
+                                f"Du hast den bestehenden Punkt **„{existing_match['Titel']}“** an dieser Stelle bereits gemeldet oder bestätigt."
                             )
+                        else:
+                            new_ratings = existing_match["bewertungen"] + [bewertung]
+                            new_tags = list(dict.fromkeys(existing_match["tags"] + ausgewaehlte_tags))
+                            new_desc = existing_match["Beschreibung"]
+                            if beschreibung.strip() not in new_desc:
+                                new_desc += f" | Ergänzung: {beschreibung.strip()}"
+                            updated_voters = list(dict.fromkeys(existing_voters + [device_id]))
+                            new_total = existing_match["bestaetigungen"] + punkte_zuwachs
+
+                            if update_point(existing_match["id"], {
+                                "bestaetigungen": new_total,
+                                "bewertungen": new_ratings,
+                                "tags": new_tags,
+                                "beschreibung": new_desc,
+                                "offiziell": existing_match["offiziell"] or offizieller_partner,
+                                "voter_ids": updated_voters
+                            }):
+                                st.session_state.last_submit_ts = now
+                                st.session_state.feedback_banner = (
+                                    f"✅ Deine Ergänzung wurde mit „{existing_match['Titel']}“ "
+                                    f"zusammengeführt ({new_total}/{DEFAULT_REQUIRED_CONFIRMATIONS} Bestätigungen)."
+                                )
+                                st.rerun()
+                            else:
+                                st.error("Fehler beim Aktualisieren in der Cloud-Datenbank.")
+                    else:
+                        neuer_punkt = {
+                            "Titel": titel.strip(),
+                            "Kategorie": kategorie,
+                            "Status": status,
+                            "Beschreibung": beschreibung.strip(),
+                            "Breitengrad": round(lat, 6),
+                            "Längengrad": round(lon, 6),
+                            "bestaetigungen": punkte_zuwachs,
+                            "bewertungen": [bewertung],
+                            "tags": ausgewaehlte_tags,
+                            "offiziell": offizieller_partner,
+                            "voter_ids": [device_id]
+                        }
+                        if insert_point(neuer_punkt):
+                            st.session_state.last_submit_ts = now
+                            if offizieller_partner:
+                                st.session_state.feedback_banner = (
+                                    f"🛡️ Offizieller Eintrag „{titel.strip()}“ wurde gespeichert und ist sofort auf der Karte sichtbar!"
+                                )
+                            else:
+                                fehlend = DEFAULT_REQUIRED_CONFIRMATIONS - 1
+                                st.session_state.feedback_banner = (
+                                    f"✅ Meldung „{titel.strip()}“ gespeichert! Sie steht jetzt im Tab „⏳ Mithelfen & Bestätigen“ "
+                                    f"und wird nach {fehlend} weiteren Bestätigungen auf der Karte freigeschaltet."
+                                )
                             st.rerun()
                         else:
-                            st.error("Fehler beim Aktualisieren in der Cloud-Datenbank.")
-                else:
-                    neuer_punkt = {
-                        "Titel": titel.strip(),
-                        "Kategorie": kategorie,
-                        "Status": status,
-                        "Beschreibung": beschreibung.strip(),
-                        "Breitengrad": round(lat, 6),
-                        "Längengrad": round(lon, 6),
-                        "bestaetigungen": punkte_zuwachs,
-                        "bewertungen": [bewertung],
-                        "tags": ausgewaehlte_tags,
-                        "offiziell": offizieller_partner,
-                        "voter_ids": [device_id]
-                    }
-                    if insert_point(neuer_punkt):
-                        st.session_state.last_submit_ts = now
-                        if offizieller_partner:
-                            st.session_state.feedback_banner = (
-                                f"🛡️ Offizieller Eintrag „{titel.strip()}“ wurde gespeichert und ist sofort auf der Karte sichtbar!"
-                            )
-                        else:
-                            fehlend = DEFAULT_REQUIRED_CONFIRMATIONS - 1
-                            st.session_state.feedback_banner = (
-                                f"✅ Meldung „{titel.strip()}“ gespeichert! Sie steht jetzt im Tab „⏳ Warteschlange“ "
-                                f"und wird nach {fehlend} weiteren Bestätigungen durch andere Personen auf der Karte freigeschaltet."
-                            )
-                        st.rerun()
+                            st.error("Fehler beim Speichern in der Cloud-Datenbank.")
+
+# =============================================================================
+# TAB 3: WARTESCHLANGE – MITHELFEN & BESTÄTIGEN
+# =============================================================================
+with tab_queue:
+    st.subheader("⏳ Neue Meldungen prüfen & bestätigen")
+    st.markdown(
+        f"Um Fake-Einträge zu vermeiden, erscheinen neue Meldungen erst ab **{min_confirmations} Bestätigungen** "
+        "auf der öffentlichen Campus-Karte. Warst du vor Ort? Bestätige den Punkt mit einem Klick!"
+    )
+
+    if all_unverified:
+        for p in all_unverified:
+            already_voted = (not st.session_state.is_admin) and (device_id in p.get("voter_ids", []))
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3.2, 1.4, 1.4])
+                with c1:
+                    kat_label = KATEGORIE_ICONS_TEXT.get(p["Kategorie"], p["Kategorie"])
+                    st.markdown(f"#### {p['Titel']}")
+                    st.caption(
+                        f"{kat_label} · Fortschritt: **{p['bestaetigungen']} / {min_confirmations} Bestätigungen** · "
+                        f"Bewertung: {format_stars(get_avg_rating(p))} · Erfasst: {p['Erstellt am']}"
+                    )
+                    st.write(p["Beschreibung"])
+                    if p.get("tags"):
+                        st.caption("🏷️ " + ", ".join(p["tags"]))
+                with c2:
+                    if already_voted:
+                        st.write("")
+                        st.info("✔ Von deinem Gerät bestätigt")
                     else:
-                        st.error("Fehler beim Speichern in der Cloud-Datenbank.")
+                        sterne_confirm = st.selectbox(
+                            "Deine Bewertung:",
+                            options=[5, 4, 3, 2, 1],
+                            format_func=lambda x: f"{x} ★",
+                            key=f"stars_{p['id']}"
+                        )
+                        if st.button("👍 Vor Ort bestätigen", key=f"confirm_{p['id']}", type="primary", use_container_width=True):
+                            updated_voters = list(dict.fromkeys(p.get("voter_ids", []) + [device_id]))
+                            update_point(p["id"], {
+                                "bestaetigungen": p["bestaetigungen"] + 1,
+                                "bewertungen": p["bewertungen"] + [sterne_confirm],
+                                "voter_ids": updated_voters
+                            })
+                            st.rerun()
+                with c3:
+                    st.write("")
+                    st.write("")
+                    if not already_voted:
+                        if st.button("🚫 Falschmeldung", key=f"spam_{p['id']}", use_container_width=True):
+                            updated_voters = list(dict.fromkeys(p.get("voter_ids", []) + [device_id]))
+                            if p["bestaetigungen"] - 1 <= 0:
+                                delete_point(p["id"])
+                            else:
+                                update_point(p["id"], {
+                                    "bestaetigungen": p["bestaetigungen"] - 1,
+                                    "voter_ids": updated_voters
+                                })
+                            st.rerun()
+    else:
+        st.success("🎉 Aktuell sind alle Meldungen geprüft – keine offenen Punkte in der Warteschlange!")
+
+# =============================================================================
+# TAB 4: ÜBER DAS PROJEKT & ADMIN-BEREICH
+# =============================================================================
+with tab_about:
+    st.subheader("ℹ️ Über Inclusive BS")
+    st.markdown(
+        """
+        **Inclusive BS** ist eine studentische Initiative für mehr Transparenz zur Barrierefreiheit rund um den Campus der **TU Braunschweig**.
+        Ziel ist es, sowohl dauerhafte Zugänge (Rampen, Aufzüge, ruhige Lernorte) als auch akute Hindernisse (defekte Aufzüge, Baustellen) in Echtzeit sichtbar zu machen.
+
+        ### 🔒 Wie funktioniert die Qualitätssicherung & der Datenschutz?
+        * **Kein Account & keine persönlichen Daten nötig:** Du musst weder Namen noch E-Mail-Adresse angeben. Dein Browser speichert lediglich eine zufällige, anonyme Kennung (`localStorage`), damit jeder Punkt pro Gerät nur einmal bestätigt werden kann.
+        * **3-Augen-Prinzip:** Neue Meldungen starten in der Warteschlange und werden automatisch auf der Hauptkarte sichtbar, sobald **3 verschiedene Geräte** sie vor Ort bestätigt haben.
+        * **Offizielle Campus-Partner:** Verifizierte Stellen (z. B. AStA, Schwerbehindertenvertretung oder Projekt-Moderation) können gesicherte Hinweise direkt freischalten.
+        """
+    )
 
     st.divider()
+    st.subheader("🔐 Admin- & Moderationsbereich")
 
-    # -------------------------------------------------------------------------
-    # Admin-Login & Moderation
-    # -------------------------------------------------------------------------
-    min_confirmations = DEFAULT_REQUIRED_CONFIRMATIONS
-    with st.expander("🔐 Admin-Bereich (TU / Moderation)"):
-        if not st.session_state.is_admin:
-            pw_input = st.text_input("Admin-Passwort:", type="password", key="admin_pw_input")
-            if st.button("Anmelden", use_container_width=True):
+    if not st.session_state.is_admin:
+        with st.form("admin_login_form"):
+            pw_col, btn_col = st.columns([3, 1])
+            with pw_col:
+                pw_input = st.text_input(
+                    "Admin-Passwort",
+                    type="password",
+                    placeholder="Passwort für TU-Moderation eingeben...",
+                    label_visibility="collapsed"
+                )
+            with btn_col:
+                login_submitted = st.form_submit_button("Anmelden", use_container_width=True)
+
+            if login_submitted:
                 if ADMIN_PASSWORD and pw_input == ADMIN_PASSWORD:
                     st.session_state.is_admin = True
                     st.rerun()
                 else:
                     st.error("Falsches Passwort oder kein Admin-Passwort konfiguriert.")
-        else:
-            st.success("Admin-Modus aktiv")
-            min_confirmations = st.slider(
-                "Benötigte Bestätigungen für Karte:",
+    else:
+        st.success("🛡️ Admin-Modus ist aktiv – du kannst jetzt offizielle Punkte erstellen sowie Einträge bearbeiten oder löschen.")
+
+        adm_c1, adm_c2 = st.columns([2, 1])
+        with adm_c1:
+            new_min_conf = st.slider(
+                "Benötigte Bestätigungen für Hauptkarte (Standard: 3):",
                 min_value=1,
                 max_value=5,
-                value=DEFAULT_REQUIRED_CONFIRMATIONS
+                value=st.session_state.min_confirmations
             )
-            if st.button("Abmelden", use_container_width=True):
+            if new_min_conf != st.session_state.min_confirmations:
+                st.session_state.min_confirmations = new_min_conf
+                st.rerun()
+        with adm_c2:
+            st.write("")
+            if st.button("🚪 Admin-Modus beenden", use_container_width=True):
                 st.session_state.is_admin = False
                 st.rerun()
 
-# -----------------------------------------------------------------------------
-# UI: Filter-Optionen & Karten-Legende
-# -----------------------------------------------------------------------------
-st.subheader("🗺️ Interaktive Campus- & Stadtkarte")
-
-filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 1.3])
-with filter_col1:
-    selected_kategorien = st.multiselect(
-        "Nach Kategorie filtern:",
-        options=KATEGORIEN,
-        default=KATEGORIEN
-    )
-with filter_col2:
-    selected_status = st.multiselect(
-        "Nach Status filtern:",
-        options=STATUS_OPTIONEN,
-        default=STATUS_OPTIONEN
-    )
-with filter_col3:
-    show_tu_pins = st.checkbox("🏛️ TU-Gebäude-Pins", value=True)
-    show_unverified_on_map = st.checkbox("👁️ Unbestätigte grau zeigen", value=False)
-
-st.caption(
-    "**Legende:** 🟢 Barrierefrei / Behoben · 🔴 Aufzug defekt · 🔵 Auditive/Visuelle Hilfe · "
-    "🟣 Ruheort · 🟠 Hindernis · ⏳ In Prüfung (Hellblau) · 🏛️ TU-Gebäude (Dunkelrot)"
-)
-
-matching_points = [
-    p for p in all_points
-    if p["Kategorie"] in selected_kategorien and p["Status"] in selected_status
-]
-
-verified_points = [p for p in matching_points if p.get("bestaetigungen", 1) >= min_confirmations]
-unverified_points = [p for p in matching_points if p.get("bestaetigungen", 1) < min_confirmations]
-points_for_map = verified_points + (unverified_points if show_unverified_on_map else [])
-
-# -----------------------------------------------------------------------------
-# Folium Karte erstellen
-# -----------------------------------------------------------------------------
-m = folium.Map(
-    location=st.session_state.map_center,
-    zoom_start=st.session_state.map_zoom,
-    tiles="OpenStreetMap"
-)
-
-if show_tu_pins:
-    tu_group = folium.FeatureGroup(name="TU Braunschweig Gebäude")
-    for b in TU_CAMPUS_PINS:
-        folium.Marker(
-            location=[b["lat"], b["lon"]],
-            popup=f"<b>{b['name']}</b><br>{b['adresse']}",
-            tooltip=f"🏛️ {b['name']}",
-            icon=folium.Icon(color="darkred", icon="university", prefix="fa")
-        ).add_to(tu_group)
-    tu_group.add_to(m)
-
-folium.CircleMarker(
-    location=[st.session_state.selected_lat, st.session_state.selected_lon],
-    radius=7,
-    color="#0066CC",
-    fill=True,
-    fill_color="#3399FF",
-    fill_opacity=0.8,
-    tooltip="Aktuell gewählte Position für neue Meldung"
-).add_to(m)
-
-for punkt in points_for_map:
-    is_verified = punkt.get("bestaetigungen", 1) >= min_confirmations
-    marker_color = get_marker_color(punkt["Kategorie"], punkt["Status"], is_verified)
-    icon_name = KATEGORIE_STYLES.get(punkt["Kategorie"], {}).get("icon", "info-sign")
-
-    avg_rating = get_avg_rating(punkt)
-    stars_str = format_stars(avg_rating)
-    tags_html = ", ".join(punkt.get("tags", [])) or "Keine Tags"
-    badge = (
-        "<span style='color:green; font-weight:bold;'>✔ Verifiziert</span>"
-        if is_verified
-        else f"<span style='color:gray;'>⏳ Unbestätigt ({punkt['bestaetigungen']}/{min_confirmations})</span>"
-    )
-    if punkt.get("offiziell"):
-        badge += " | <span style='color:#BE1E3C; font-weight:bold;'>🛡️ Offiziell</span>"
-
-    popup_html = f"""
-    <div style="font-family: sans-serif; min-width: 230px;">
-        <h4 style="margin: 0 0 4px 0;">{punkt['Titel']}</h4>
-        <div style="margin-bottom: 6px; font-size: 12px;">{badge}</div>
-        <p style="margin: 2px 0;"><b>Bewertung:</b> {stars_str} ({len(punkt.get('bewertungen', []))}x)</p>
-        <p style="margin: 2px 0;"><b>Kategorie:</b> {punkt['Kategorie']}</p>
-        <p style="margin: 2px 0;"><b>Status:</b> {punkt['Status']}</p>
-        <p style="margin: 2px 0;"><b>Tags:</b> {tags_html}</p>
-        <p style="margin: 6px 0 0 0;">{punkt['Beschreibung']}</p>
-        <hr style="margin: 6px 0;">
-        <small style="color: gray;">Bestätigungen: {punkt['bestaetigungen']} | Erfasst: {punkt['Erstellt am']}</small>
-    </div>
-    """
-
-    folium.Marker(
-        location=[punkt["Breitengrad"], punkt["Längengrad"]],
-        popup=folium.Popup(popup_html, max_width=320),
-        tooltip=f"{punkt['Titel']} | {stars_str}",
-        icon=folium.Icon(color=marker_color, icon=icon_name, prefix="fa")
-    ).add_to(m)
-
-folium.LayerControl().add_to(m)
-
-map_data = st_folium(
-    m,
-    width="100%",
-    height=540,
-    key="inclusive_bs_map",
-    returned_objects=["last_clicked", "center", "zoom"]
-)
-
-if map_data and map_data.get("last_clicked"):
-    clicked_lat = round(map_data["last_clicked"]["lat"], 6)
-    clicked_lon = round(map_data["last_clicked"]["lng"], 6)
-    if (
-        clicked_lat != round(st.session_state.selected_lat, 6)
-        or clicked_lon != round(st.session_state.selected_lon, 6)
-    ):
-        st.session_state.selected_lat = clicked_lat
-        st.session_state.selected_lon = clicked_lon
-        if map_data.get("center"):
-            st.session_state.map_center = [map_data["center"]["lat"], map_data["center"]["lng"]]
-        if map_data.get("zoom"):
-            st.session_state.map_zoom = map_data["zoom"]
-        st.rerun()
-
-# -----------------------------------------------------------------------------
-# UI: Tabs unter der Karte
-# -----------------------------------------------------------------------------
-st.divider()
-tab_verified, tab_queue = st.tabs([
-    f"✅ Verifizierte Punkte auf der Karte ({len(verified_points)})",
-    f"⏳ Warteschlange – Bitte bestätigen ({len(unverified_points)})"
-])
-
-with tab_verified:
-    if verified_points:
-        table_data = [
-            {
-                "Titel": p["Titel"],
-                "Kategorie": p["Kategorie"],
-                "Bewertung": format_stars(get_avg_rating(p)),
-                "Bestätigungen": f"{p['bestaetigungen']}" + (" 🛡️" if p.get("offiziell") else ""),
-                "Status": p["Status"],
-                "Koordinaten": f"{p['Breitengrad']}, {p['Längengrad']}",
-                "Beschreibung": p["Beschreibung"]
+        if all_points:
+            st.markdown("#### 🛠️ Gespeicherte Einträge verwalten")
+            admin_options = {
+                f"#{p['id']} · {p['Titel']} ({p['Status']} | {p['bestaetigungen']} Bestätigungen)": p
+                for p in all_points
             }
-            for p in verified_points
-        ]
-        st.table(table_data)
-    else:
-        st.info(
-            f"Aktuell gibt es noch keine Punkte mit mindestens {min_confirmations} Bestätigungen. "
-            "Wechsle in den Tab 'Warteschlange', um gemeldete Punkte zu bestätigen!"
-        )
-
-    # Admin-Moderation (Status ändern / offiziell markieren / löschen)
-    if st.session_state.is_admin and all_points:
-        with st.expander("🛠️ Admin-Moderation: Einträge bearbeiten oder löschen"):
-            admin_options = {f"{p['Titel']} (ID {p['id']} | {p['Status']})": p for p in all_points}
             selected_label = st.selectbox("Eintrag auswählen:", options=list(admin_options.keys()))
             target_point = admin_options[selected_label]
+
+            st.caption(
+                f"Koordinaten: `{target_point['Breitengrad']}, {target_point['Längengrad']}` · "
+                f"Offiziell: {'Ja' if target_point.get('offiziell') else 'Nein'}"
+            )
 
             col_a1, col_a2, col_a3 = st.columns([2, 1.5, 1.5])
             with col_a1:
                 new_status = st.selectbox(
-                    "Status aktualisieren:",
+                    "Status ändern:",
                     options=STATUS_OPTIONEN,
                     index=STATUS_OPTIONEN.index(target_point["Status"]) if target_point["Status"] in STATUS_OPTIONEN else 0
                 )
@@ -639,60 +807,6 @@ with tab_verified:
             with col_a3:
                 st.write("")
                 st.write("")
-                if st.button("🗑️ Punkt löschen", type="primary", use_container_width=True):
+                if st.button("🗑️ Punkt endgültig löschen", type="primary", use_container_width=True):
                     delete_point(target_point["id"])
                     st.rerun()
-
-with tab_queue:
-    st.caption(
-        f"Hier erscheinen neue Meldungen, die noch weniger als **{min_confirmations} Bestätigungen** haben. "
-        "Jedes Gerät kann einen Eintrag einmalig bestätigen."
-    )
-    if unverified_points:
-        for p in unverified_points:
-            already_voted = (not st.session_state.is_admin) and (device_id in p.get("voter_ids", []))
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([3, 1.5, 1.5])
-                with c1:
-                    st.markdown(f"**{p['Titel']}** ({p['Kategorie']})")
-                    st.caption(
-                        f"Fortschritt: **{p['bestaetigungen']} / {min_confirmations} Bestätigungen** | "
-                        f"Bewertung: {format_stars(get_avg_rating(p))} | "
-                        f"Koordinaten: {p['Breitengrad']}, {p['Längengrad']}"
-                    )
-                    st.write(p["Beschreibung"])
-                with c2:
-                    if already_voted:
-                        st.write("")
-                        st.info("✔ Von deinem Gerät bestätigt")
-                    else:
-                        sterne_confirm = st.selectbox(
-                            "Bewertung:",
-                            options=[5, 4, 3, 2, 1],
-                            format_func=lambda x: f"{x} ★",
-                            key=f"stars_{p['id']}"
-                        )
-                        if st.button("👍 Vor Ort bestätigen", key=f"confirm_{p['id']}", use_container_width=True):
-                            updated_voters = list(dict.fromkeys(p.get("voter_ids", []) + [device_id]))
-                            update_point(p["id"], {
-                                "bestaetigungen": p["bestaetigungen"] + 1,
-                                "bewertungen": p["bewertungen"] + [sterne_confirm],
-                                "voter_ids": updated_voters
-                            })
-                            st.rerun()
-                with c3:
-                    st.write("")
-                    st.write("")
-                    if not already_voted:
-                        if st.button("🚫 Falschmeldung / Spam", key=f"spam_{p['id']}", use_container_width=True):
-                            updated_voters = list(dict.fromkeys(p.get("voter_ids", []) + [device_id]))
-                            if p["bestaetigungen"] - 1 <= 0:
-                                delete_point(p["id"])
-                            else:
-                                update_point(p["id"], {
-                                    "bestaetigungen": p["bestaetigungen"] - 1,
-                                    "voter_ids": updated_voters
-                                })
-                            st.rerun()
-    else:
-        st.success("Keine offenen unbestätigten Meldungen in der Warteschlange.")
