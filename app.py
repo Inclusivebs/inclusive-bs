@@ -1,6 +1,8 @@
 import math
 import time
 import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -34,6 +36,7 @@ DEFAULT_ZOOM = 16
 CLUSTER_RADIUS_METERS = 10.0
 DEFAULT_REQUIRED_CONFIRMATIONS = 3
 SUBMIT_COOLDOWN_SECONDS = 20
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
 
 KATEGORIEN = [
     "Rollstuhlgerecht / Rampe",
@@ -119,8 +122,18 @@ def init_anonymous_device_id() -> str:
 
 
 # -----------------------------------------------------------------------------
-# Geodaten- & Supabase-Datenbankfunktionen
+# Geodaten-, Zeit- & Supabase-Datenbankfunktionen
 # -----------------------------------------------------------------------------
+def format_local_timestamp(iso_str: str) -> str:
+    """Wandelt einen UTC-ISO-Zeitstempel aus Supabase in deutsche Ortszeit um."""
+    try:
+        dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        dt_local = dt_utc.astimezone(LOCAL_TZ)
+        return dt_local.strftime("%d.%m.%Y, %H:%M Uhr")
+    except Exception:
+        return iso_str[:16].replace("T", " ")
+
+
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371000.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -146,7 +159,7 @@ def load_data() -> list:
                     "Beschreibung": r["beschreibung"],
                     "Breitengrad": r["breitengrad"],
                     "Längengrad": r["laengengrad"],
-                    "Erstellt am": r["created_at"][:16].replace("T", " "),
+                    "Erstellt am": format_local_timestamp(r["created_at"]),
                     "bestaetigungen": r.get("bestaetigungen", 1),
                     "bewertungen": r.get("bewertungen") or [5],
                     "tags": r.get("tags") or [],
@@ -237,16 +250,24 @@ if "is_admin" not in st.session_state:
 if "last_submit_ts" not in st.session_state:
     st.session_state.last_submit_ts = 0.0
 
+if "feedback_banner" not in st.session_state:
+    st.session_state.feedback_banner = None
+
 all_points = load_data()
 
 # -----------------------------------------------------------------------------
-# UI: Kopfbereich
+# UI: Kopfbereich & Feedback-Banner
 # -----------------------------------------------------------------------------
-st.title("♿ Inclusive BS – Crowdsourced Barrierefreiheits-Guide Braunschweig")
+st.title("♿ Inclusive BS – Barrierefreiheits-Guide TU Braunschweig")
 st.markdown(
-    "Melde barrierefreie Zugänge, defekte Aufzüge, Ruheorte oder Hindernisse rund um die TU Braunschweig. "
-    "**Tipp:** Klicke einfach direkt auf eine beliebige Stelle in der Karte – die Koordinaten werden sofort links ins Formular übernommen!"
+    "Melde barrierefreie Zugänge, defekte Aufzüge, Ruheorte oder Hindernisse rund um den Campus. "
+    "**Tipp:** Klicke direkt auf eine Stelle in der Karte – die Koordinaten werden automatisch ins Formular übernommen "
+    "*(📱 am Smartphone: tippe oben links auf **`>`**, um das Meldeformular zu öffnen)*."
 )
+
+if st.session_state.feedback_banner:
+    st.success(st.session_state.feedback_banner)
+    st.session_state.feedback_banner = None
 
 # -----------------------------------------------------------------------------
 # UI: Sidebar – Eingabemaske & Admin-Zugang
@@ -339,6 +360,9 @@ with st.sidebar:
                 existing_match = None
                 if enable_clustering:
                     for p in all_points:
+                        # Offizielle Admin-Pins sind vor Überschreiben durch Gäste geschützt
+                        if p.get("offiziell") and not st.session_state.is_admin:
+                            continue
                         dist = haversine_meters(lat, lon, p["Breitengrad"], p["Längengrad"])
                         if dist <= CLUSTER_RADIUS_METERS and p["Kategorie"] == kategorie:
                             existing_match = p
@@ -359,9 +383,10 @@ with st.sidebar:
                         if beschreibung.strip() not in new_desc:
                             new_desc += f" | Ergänzung: {beschreibung.strip()}"
                         updated_voters = list(dict.fromkeys(existing_voters + [device_id]))
+                        new_total = existing_match["bestaetigungen"] + punkte_zuwachs
 
                         if update_point(existing_match["id"], {
-                            "bestaetigungen": existing_match["bestaetigungen"] + punkte_zuwachs,
+                            "bestaetigungen": new_total,
                             "bewertungen": new_ratings,
                             "tags": new_tags,
                             "beschreibung": new_desc,
@@ -369,6 +394,10 @@ with st.sidebar:
                             "voter_ids": updated_voters
                         }):
                             st.session_state.last_submit_ts = now
+                            st.session_state.feedback_banner = (
+                                f"✅ Deine Ergänzung wurde mit dem bestehenden Punkt „{existing_match['Titel']}“ "
+                                f"zusammengeführt ({new_total}/{DEFAULT_REQUIRED_CONFIRMATIONS} Bestätigungen)."
+                            )
                             st.rerun()
                         else:
                             st.error("Fehler beim Aktualisieren in der Cloud-Datenbank.")
@@ -388,6 +417,16 @@ with st.sidebar:
                     }
                     if insert_point(neuer_punkt):
                         st.session_state.last_submit_ts = now
+                        if offizieller_partner:
+                            st.session_state.feedback_banner = (
+                                f"🛡️ Offizieller Eintrag „{titel.strip()}“ wurde gespeichert und ist sofort auf der Karte sichtbar!"
+                            )
+                        else:
+                            fehlend = DEFAULT_REQUIRED_CONFIRMATIONS - 1
+                            st.session_state.feedback_banner = (
+                                f"✅ Meldung „{titel.strip()}“ gespeichert! Sie steht jetzt im Tab „⏳ Warteschlange“ "
+                                f"und wird nach {fehlend} weiteren Bestätigungen durch andere Personen auf der Karte freigeschaltet."
+                            )
                         st.rerun()
                     else:
                         st.error("Fehler beim Speichern in der Cloud-Datenbank.")
@@ -420,9 +459,9 @@ with st.sidebar:
                 st.rerun()
 
 # -----------------------------------------------------------------------------
-# UI: Filter-Optionen über der Karte
+# UI: Filter-Optionen & Karten-Legende
 # -----------------------------------------------------------------------------
-st.subheader("🗺️ Interaktive Stadtkarte")
+st.subheader("🗺️ Interaktive Campus- & Stadtkarte")
 
 filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 1.3])
 with filter_col1:
@@ -440,6 +479,11 @@ with filter_col2:
 with filter_col3:
     show_tu_pins = st.checkbox("🏛️ TU-Gebäude-Pins", value=True)
     show_unverified_on_map = st.checkbox("👁️ Unbestätigte grau zeigen", value=False)
+
+st.caption(
+    "**Legende:** 🟢 Barrierefrei / Behoben · 🔴 Aufzug defekt · 🔵 Auditive/Visuelle Hilfe · "
+    "🟣 Ruheort · 🟠 Hindernis · ⏳ In Prüfung (Hellblau) · 🏛️ TU-Gebäude (Dunkelrot)"
+)
 
 matching_points = [
     p for p in all_points
