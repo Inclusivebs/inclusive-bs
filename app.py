@@ -88,7 +88,7 @@ TU_CAMPUS_PINS = [
     {"name": "Biozentrum", "adresse": "Spielmannstraße 7", "lat": 52.27415, "lon": 10.53130},
     {"name": "Architektur-Pavillons", "adresse": "Pockelsstraße 3", "lat": 52.27340, "lon": 10.52625},
     {"name": "Mensa 1", "adresse": "Katharinenstraße 1", "lat": 52.27520, "lon": 10.52790},
-    {"name": "Informatikzentrum (IZ)", "adresse": "Mühlenpfordtstraße 23", "lat": 52.27525, "lon": 10.52530},
+    {"name": "Informatikzentrum (IZ)", "adresse": "Mühlenpfordtstraße 23", "lat": 52.27323, "lon": 10.52514},
 ]
 
 # -----------------------------------------------------------------------------
