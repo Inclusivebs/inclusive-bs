@@ -764,8 +764,8 @@ with tab_about:
         with adm_c1:
             new_min_conf = st.slider(
                 "Benötigte Bestätigungen für Hauptkarte (Standard: 3):",
-                min_value=1,
-                max_value=5,
+                min_value=3,
+                max_value=30,
                 value=st.session_state.min_confirmations
             )
             if new_min_conf != st.session_state.min_confirmations:
