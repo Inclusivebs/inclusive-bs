@@ -81,11 +81,11 @@ KATEGORIE_STYLES = {
 
 TU_CAMPUS_PINS = [
     {"name": "Altgebäude (Hauptgebäude TU BS)", "adresse": "Pockelsstraße 4", "lat": 52.27345, "lon": 10.52765},
-    {"name": "Okerhochhaus", "adresse": "Pockelsstraße 14", "lat": 52.27245, "lon": 10.52755},
+    {"name": "Okerhochhaus", "adresse": "Pockelsstraße 14", "lat": 52.27278, "lon": 10.52746},
     {"name": "Universitätsbibliothek (UB)", "adresse": "Universitätsplatz 1", "lat": 52.27385, "lon": 10.52923},
     {"name": "Forum-Gebäude / Hochhaus", "adresse": "Universitätsplatz 2", "lat": 52.27349, "lon": 10.52972},
     {"name": "Auditorium Maximum (Audimax)", "adresse": "Universitätsplatz 3", "lat": 52.27297, "lon": 10.52970},
-    {"name": "Biozentrum", "adresse": "Spielmannstraße 7", "lat": 52.27415, "lon": 10.53130},
+    {"name": "Biozentrum", "adresse": "Spielmannstraße 7", "lat": 52.27425, "lon": 10.53077},
     {"name": "Architektur-Pavillons", "adresse": "Pockelsstraße 3", "lat": 52.27340, "lon": 10.52625},
     {"name": "Mensa 1", "adresse": "Katharinenstraße 1", "lat": 52.27465, "lon": 10.52611},
     {"name": "Informatikzentrum (IZ)", "adresse": "Mühlenpfordtstraße 23", "lat": 52.27323, "lon": 10.52514},
