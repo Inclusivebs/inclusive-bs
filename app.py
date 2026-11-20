@@ -1,7 +1,7 @@
 import math
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
@@ -44,6 +44,7 @@ KATEGORIEN = [
     "Aufzug defekt / außer Betrieb",
     "Auditive / Visuelle Hilfe",
     "Ruheort",
+    "Temporärer Ruhe-/Arbeitsraum",
     "Sonstiges Hindernis"
 ]
 
@@ -52,6 +53,7 @@ KATEGORIE_ICONS_TEXT = {
     "Aufzug defekt / außer Betrieb": "🚨 Aufzug defekt / außer Betrieb",
     "Auditive / Visuelle Hilfe": "🔊 Auditive / Visuelle Hilfe",
     "Ruheort": "🌿 Ruheort",
+    "Temporärer Ruhe-/Arbeitsraum": "🕒 Temporärer Ruhe-/Arbeitsraum",
     "Sonstiges Hindernis": "⚠️ Sonstiges Hindernis"
 }
 
@@ -68,7 +70,9 @@ BEWERTUNGS_TAGS = [
     "Steil / Hilfe nötig",
     "Reizarm / Leise",
     "Sitzgelegenheit",
-    "Gut ausgeschildert"
+    "Gut ausgeschildert",
+    "Steckdosen vorhanden",
+    "WLAN verfügbar"
 ]
 
 KATEGORIE_STYLES = {
@@ -76,6 +80,7 @@ KATEGORIE_STYLES = {
     "Aufzug defekt / außer Betrieb": {"color": "red", "icon": "exclamation-triangle"},
     "Auditive / Visuelle Hilfe": {"color": "blue", "icon": "volume-up"},
     "Ruheort": {"color": "purple", "icon": "leaf"},
+    "Temporärer Ruhe-/Arbeitsraum": {"color": "darkgreen", "icon": "clock-o"},
     "Sonstiges Hindernis": {"color": "orange", "icon": "info-sign"}
 }
 
@@ -92,7 +97,7 @@ TU_CAMPUS_PINS = [
 ]
 
 # -----------------------------------------------------------------------------
-# Anonyme Geräte-ID über Browser-localStorage (ohne Login / personenbezogene Daten)
+# Anonyme Geräte-ID & Browser-Standort (GPS)
 # -----------------------------------------------------------------------------
 def init_anonymous_device_id() -> str:
     """Erzeugt oder liest eine anonyme Geräte-ID aus dem Browser-localStorage."""
@@ -130,17 +135,78 @@ def init_anonymous_device_id() -> str:
     return st.session_state.device_id
 
 
+def sync_browser_gps_from_query():
+    """Übernimmt vom Browser übergebene GPS-Koordinaten aus den URL-Parametern."""
+    ulat = st.query_params.get("ulat")
+    ulon = st.query_params.get("ulon")
+    if ulat and ulon:
+        try:
+            lat_val = round(float(ulat), 6)
+            lon_val = round(float(ulon), 6)
+            if -90 <= lat_val <= 90 and -180 <= lon_val <= 180:
+                st.session_state.user_gps = (lat_val, lon_val)
+        except ValueError:
+            pass
+
+
+def trigger_browser_gps_request():
+    """Fragt einmalig die aktuelle Position über die Browser Geolocation API an."""
+    components.html(
+        """
+        <script>
+        (function() {
+            if (!navigator.geolocation) {
+                alert("Dein Browser unterstützt keine Standortabfrage.");
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(
+                function(pos) {
+                    const lat = pos.coords.latitude.toFixed(6);
+                    const lon = pos.coords.longitude.toFixed(6);
+                    const url = new URL(window.parent.location.href);
+                    url.searchParams.set("ulat", lat);
+                    url.searchParams.set("ulon", lon);
+                    window.parent.location.href = url.toString();
+                },
+                function(err) {
+                    alert("Standort konnte nicht abgerufen werden. Bitte erlaube den Standortzugriff im Browser.");
+                },
+                { enableHighAccuracy: true, timeout: 10000 }
+            );
+        })();
+        </script>
+        """,
+        height=0,
+        width=0
+    )
+
+
 # -----------------------------------------------------------------------------
 # Geodaten-, Zeit- & Supabase-Datenbankfunktionen
 # -----------------------------------------------------------------------------
-def format_local_timestamp(iso_str: str) -> str:
-    """Wandelt einen UTC-ISO-Zeitstempel aus Supabase in deutsche Ortszeit um."""
+def parse_iso_local(iso_str: str | None) -> datetime | None:
+    if not iso_str:
+        return None
     try:
         dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        dt_local = dt_utc.astimezone(LOCAL_TZ)
-        return dt_local.strftime("%d.%m.%Y, %H:%M Uhr")
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
+        return dt_utc.astimezone(LOCAL_TZ)
     except Exception:
-        return iso_str[:16].replace("T", " ")
+        return None
+
+
+def format_local_timestamp(iso_str: str) -> str:
+    dt_local = parse_iso_local(iso_str)
+    if dt_local:
+        return dt_local.strftime("%d.%m.%Y, %H:%M Uhr")
+    return iso_str[:16].replace("T", " ")
+
+
+def format_distance(meters: float) -> str:
+    if meters < 1000:
+        return f"{int(round(meters / 5.0) * 5)} m"
+    return f"{meters / 1000.0:.1f} km"
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -159,8 +225,12 @@ def load_data() -> list:
         resp = requests.get(url, headers=HEADERS, timeout=10)
         if resp.status_code == 200:
             rows = resp.json()
-            return [
-                {
+            now_local = datetime.now(LOCAL_TZ)
+            result = []
+            for r in rows:
+                valid_until_dt = parse_iso_local(r.get("gueltig_bis"))
+                is_expired = bool(valid_until_dt and valid_until_dt <= now_local)
+                result.append({
                     "id": r["id"],
                     "Titel": r["titel"],
                     "Kategorie": r["kategorie"],
@@ -173,10 +243,12 @@ def load_data() -> list:
                     "bewertungen": r.get("bewertungen") or [5],
                     "tags": r.get("tags") or [],
                     "offiziell": r.get("offiziell", False),
-                    "voter_ids": r.get("voter_ids") or []
-                }
-                for r in rows
-            ]
+                    "voter_ids": r.get("voter_ids") or [],
+                    "gueltig_bis_dt": valid_until_dt,
+                    "gueltig_bis_str": valid_until_dt.strftime("%d.%m.%Y, %H:%M Uhr") if valid_until_dt else None,
+                    "is_expired": is_expired
+                })
+            return result
     except Exception:
         pass
     return []
@@ -195,7 +267,8 @@ def insert_point(punkt: dict) -> bool:
         "bewertungen": punkt["bewertungen"],
         "tags": punkt["tags"],
         "offiziell": punkt["offiziell"],
-        "voter_ids": punkt["voter_ids"]
+        "voter_ids": punkt["voter_ids"],
+        "gueltig_bis": punkt.get("gueltig_bis")
     }
     resp = requests.post(url, headers=HEADERS, json=payload, timeout=10)
     return resp.status_code in (200, 201)
@@ -226,7 +299,7 @@ def format_stars(avg: float) -> str:
 def get_marker_color(kategorie: str, status: str, is_verified: bool) -> str:
     if not is_verified:
         return "lightgray"
-    if status == "Behoben / Barrierefrei":
+    if status == "Behoben / Barrierefrei" and kategorie != "Temporärer Ruhe-/Arbeitsraum":
         return "green"
     if status == "In Prüfung":
         return "cadetblue"
@@ -237,6 +310,14 @@ def get_marker_color(kategorie: str, status: str, is_verified: bool) -> str:
 # Session State & Geräte-ID Initialisierung
 # -----------------------------------------------------------------------------
 device_id = init_anonymous_device_id()
+
+if "user_gps" not in st.session_state:
+    st.session_state.user_gps = None
+
+if "request_gps_now" not in st.session_state:
+    st.session_state.request_gps_now = False
+
+sync_browser_gps_from_query()
 
 if "selected_lat" not in st.session_state:
     st.session_state.selected_lat = BS_CENTER_LAT
@@ -268,11 +349,15 @@ if "last_submit_ts" not in st.session_state:
 if "feedback_banner" not in st.session_state:
     st.session_state.feedback_banner = None
 
-all_points = load_data()
+all_points_raw = load_data()
+# Abgelaufene zeitlich begrenzte Einträge für die öffentliche Ansicht ausblenden
+active_points = [p for p in all_points_raw if not p.get("is_expired")]
+expired_points = [p for p in all_points_raw if p.get("is_expired")]
+
 min_confirmations = st.session_state.min_confirmations if st.session_state.is_admin else DEFAULT_REQUIRED_CONFIRMATIONS
 
-all_verified = [p for p in all_points if p.get("bestaetigungen", 1) >= min_confirmations]
-all_unverified = [p for p in all_points if p.get("bestaetigungen", 1) < min_confirmations]
+all_verified = [p for p in active_points if p.get("bestaetigungen", 1) >= min_confirmations]
+all_unverified = [p for p in active_points if p.get("bestaetigungen", 1) < min_confirmations]
 active_issues = [
     p for p in all_verified
     if p["Kategorie"] in ("Aufzug defekt / außer Betrieb", "Sonstiges Hindernis")
@@ -318,15 +403,31 @@ tab_map, tab_report, tab_queue, tab_about = st.tabs([
 # TAB 1: INTERAKTIVE KARTE & VERIFIZIERTE ORTE
 # =============================================================================
 with tab_map:
-    search_col, filter_btn_col = st.columns([3, 1])
+    search_col, gps_col, toggle_col = st.columns([2.6, 1.2, 1.2])
     with search_col:
         search_query = st.text_input(
             "Suche",
             placeholder="🔍 Nach Gebäude, Hörsaal, Rampe oder Stichwort suchen (z. B. Audimax, UB, Aufzug)...",
             label_visibility="collapsed"
         )
-    with filter_btn_col:
-        show_unverified_on_map = st.toggle("Unbestätigte grau zeigen", value=False)
+    with gps_col:
+        if st.session_state.user_gps is None:
+            if st.button("📍 In meiner Nähe", use_container_width=True):
+                st.session_state.request_gps_now = True
+        else:
+            if st.button("📍 Standort aktiv (Aus)", use_container_width=True):
+                st.session_state.user_gps = None
+                if "ulat" in st.query_params:
+                    del st.query_params["ulat"]
+                if "ulon" in st.query_params:
+                    del st.query_params["ulon"]
+                st.rerun()
+    with toggle_col:
+        show_unverified_on_map = st.toggle("Unbestätigte grau", value=False)
+
+    if st.session_state.request_gps_now:
+        st.session_state.request_gps_now = False
+        trigger_browser_gps_request()
 
     with st.expander("🎛️ Filter nach Kategorie & Status anpassen", expanded=False):
         f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
@@ -348,7 +449,7 @@ with tab_map:
 
     query_lower = search_query.strip().lower()
     matching_points = [
-        p for p in all_points
+        p for p in active_points
         if p["Kategorie"] in selected_kategorien
         and p["Status"] in selected_status
         and (
@@ -360,16 +461,38 @@ with tab_map:
         )
     ]
 
+    # Entfernung berechnen & bei aktivem Standort nach Nähe sortieren
+    if st.session_state.user_gps:
+        u_lat, u_lon = st.session_state.user_gps
+        for p in matching_points:
+            p["distance_m"] = haversine_meters(u_lat, u_lon, p["Breitengrad"], p["Längengrad"])
+        matching_points.sort(key=lambda x: x["distance_m"])
+    else:
+        for p in matching_points:
+            p["distance_m"] = None
+
     verified_points = [p for p in matching_points if p.get("bestaetigungen", 1) >= min_confirmations]
     unverified_points = [p for p in matching_points if p.get("bestaetigungen", 1) < min_confirmations]
     points_for_map = verified_points + (unverified_points if show_unverified_on_map else [])
 
-    # Karte rendern
+    # Karte rendern (bei aktivem GPS auf Nutzerposition zentrieren)
+    current_center = list(st.session_state.user_gps) if st.session_state.user_gps else st.session_state.map_center
     m = folium.Map(
-        location=st.session_state.map_center,
+        location=current_center,
         zoom_start=st.session_state.map_zoom,
         tiles="OpenStreetMap"
     )
+
+    if st.session_state.user_gps:
+        folium.CircleMarker(
+            location=list(st.session_state.user_gps),
+            radius=9,
+            color="#0055FF",
+            fill=True,
+            fill_color="#3388FF",
+            fill_opacity=0.9,
+            tooltip="📍 Dein aktueller Standort"
+        ).add_to(m)
 
     if show_tu_pins:
         tu_group = folium.FeatureGroup(name="TU Braunschweig Gebäude")
@@ -398,10 +521,21 @@ with tab_map:
         if punkt.get("offiziell"):
             badge += " | <span style='color:#BE1E3C; font-weight:bold;'>🛡️ Offiziell</span>"
 
+        valid_html = (
+            f"<p style='margin: 2px 0; color: #0F766E;'><b>🕒 Gültig bis:</b> {punkt['gueltig_bis_str']}</p>"
+            if punkt.get("gueltig_bis_str") else ""
+        )
+        dist_html = (
+            f"<p style='margin: 2px 0;'><b>📍 Entfernung:</b> ca. {format_distance(punkt['distance_m'])}</p>"
+            if punkt.get("distance_m") is not None else ""
+        )
+
         popup_html = f"""
         <div style="font-family: sans-serif; min-width: 230px;">
             <h4 style="margin: 0 0 4px 0;">{punkt['Titel']}</h4>
             <div style="margin-bottom: 6px; font-size: 12px;">{badge}</div>
+            {valid_html}
+            {dist_html}
             <p style="margin: 2px 0;"><b>Bewertung:</b> {stars_str} ({len(punkt.get('bewertungen', []))}x)</p>
             <p style="margin: 2px 0;"><b>Kategorie:</b> {punkt['Kategorie']}</p>
             <p style="margin: 2px 0;"><b>Status:</b> {punkt['Status']}</p>
@@ -430,25 +564,35 @@ with tab_map:
     )
 
     st.caption(
-        "**Legende:** 🟢 Barrierefrei / Behoben · 🔴 Aufzug defekt · 🔵 Auditive/Visuelle Hilfe · "
-        "🟣 Ruheort · 🟠 Hindernis · ⏳ In Prüfung (Hellblau) · 🏛️ TU-Gebäude (Dunkelrot)"
+        "**Legende:** 🟢 Barrierefrei / Behoben · 🌲 Temporärer Arbeitsraum · 🔴 Aufzug defekt · "
+        "🔵 Auditive/Visuelle Hilfe · 🟣 Ruheort · 🟠 Hindernis · 🏛️ TU-Gebäude"
     )
 
-    st.subheader(f"📍 Verifizierte Campus-Orte ({len(verified_points)})")
+    list_header = (
+        f"📍 Verifizierte Campus-Orte ({len(verified_points)}) – sortiert nach Entfernung"
+        if st.session_state.user_gps
+        else f"📍 Verifizierte Campus-Orte ({len(verified_points)})"
+    )
+    st.subheader(list_header)
+
     if verified_points:
         for p in verified_points:
             with st.container(border=True):
                 top_l, top_r = st.columns([3.5, 1.5])
                 with top_l:
                     title_suffix = " · 🛡️ **Offiziell**" if p.get("offiziell") else ""
-                    st.markdown(f"#### {p['Titel']}{title_suffix}")
+                    dist_badge = f" · 📍 **{format_distance(p['distance_m'])}**" if p.get("distance_m") is not None else ""
+                    st.markdown(f"#### {p['Titel']}{title_suffix}{dist_badge}")
                     kat_label = KATEGORIE_ICONS_TEXT.get(p["Kategorie"], p["Kategorie"])
                     st.caption(
                         f"{kat_label} · **Status:** {p['Status']} · "
                         f"**Bewertung:** {format_stars(get_avg_rating(p))} ({p['bestaetigungen']} Bestätigungen)"
                     )
                 with top_r:
-                    st.caption(f"🕒 {p['Erstellt am']}")
+                    if p.get("gueltig_bis_str"):
+                        st.info(f"🕒 Frei bis {p['gueltig_bis_str']}")
+                    else:
+                        st.caption(f"🕒 Erfasst: {p['Erstellt am']}")
                     if p.get("tags"):
                         st.caption("🏷️ " + ", ".join(p["tags"]))
 
@@ -529,7 +673,7 @@ with tab_report:
         with st.form("add_point_form", clear_on_submit=True):
             titel = st.text_input(
                 "Titel / genauer Ort *",
-                placeholder='z. B. "Audimax – Rampe Haupteingang" oder "UB – Aufzug Nord"'
+                placeholder='z. B. "Hörsaal SN 19.1 – Frei bis 16 Uhr" oder "Audimax – Rampe"'
             )
             kategorie = st.selectbox(
                 "Kategorie *",
@@ -537,6 +681,19 @@ with tab_report:
                 format_func=lambda k: KATEGORIE_ICONS_TEXT.get(k, k)
             )
             status = st.selectbox("Aktueller Status *", options=STATUS_OPTIONEN)
+
+            # Zeitliche Begrenzung (ideal für kurzfristig freie Räume oder Baustellen)
+            is_time_limited = st.checkbox(
+                "🕒 Zeitlich begrenzt (z. B. Raum nur heute bis zu einer bestimmten Uhrzeit frei)",
+                value=False
+            )
+            now_de = datetime.now(LOCAL_TZ)
+            default_end = now_de + timedelta(hours=2)
+            t_col1, t_col2 = st.columns(2)
+            with t_col1:
+                valid_date = st.date_input("Gültig bis (Datum):", value=default_end.date())
+            with t_col2:
+                valid_time = st.time_input("Gültig bis (Uhrzeit):", value=default_end.time().replace(second=0, microsecond=0))
 
             bewertung = st.slider(
                 "Qualitäts-Bewertung (1 = unzugänglich / schlecht, 5 = vorbildlich)",
@@ -550,8 +707,8 @@ with tab_report:
             )
             beschreibung = st.text_area(
                 "Detailbeschreibung *",
-                placeholder="Beschreibe die Situation vor Ort (z. B. Etage, Eingang, Türbreite, Umweg)...",
-                height=110
+                placeholder="Beschreibe die Situation vor Ort (z. B. Etage, Raumnummer, Eingang, Türbreite)...",
+                height=105
             )
 
             lat = float(st.session_state.selected_lat)
@@ -576,18 +733,28 @@ with tab_report:
                 now = time.time()
                 seconds_since_last = now - st.session_state.last_submit_ts
 
+                gueltig_bis_iso = None
+                valid_dt_local = None
+                if is_time_limited:
+                    valid_dt_local = datetime.combine(valid_date, valid_time).replace(tzinfo=LOCAL_TZ)
+                    gueltig_bis_iso = valid_dt_local.isoformat()
+
                 if not titel.strip():
                     st.error("Bitte gib einen Titel oder Ort an.")
                 elif not beschreibung.strip():
                     st.error("Bitte füge eine kurze Detailbeschreibung hinzu.")
+                elif is_time_limited and valid_dt_local <= datetime.now(LOCAL_TZ):
+                    st.error("Bitte wähle für zeitlich begrenzte Einträge einen Zeitpunkt in der Zukunft.")
                 elif not st.session_state.is_admin and seconds_since_last < SUBMIT_COOLDOWN_SECONDS:
                     wait_sec = int(SUBMIT_COOLDOWN_SECONDS - seconds_since_last)
                     st.warning(f"Bitte warte noch {wait_sec} Sekunden, bevor du eine weitere Meldung absendest.")
                 else:
                     existing_match = None
-                    if enable_clustering:
-                        for p in all_points:
+                    if enable_clustering and not is_time_limited:
+                        for p in active_points:
                             if p.get("offiziell") and not st.session_state.is_admin:
+                                continue
+                            if p.get("gueltig_bis_str"):
                                 continue
                             dist = haversine_meters(lat, lon, p["Breitengrad"], p["Längengrad"])
                             if dist <= CLUSTER_RADIUS_METERS and p["Kategorie"] == kategorie:
@@ -639,7 +806,8 @@ with tab_report:
                             "bewertungen": [bewertung],
                             "tags": ausgewaehlte_tags,
                             "offiziell": offizieller_partner,
-                            "voter_ids": [device_id]
+                            "voter_ids": [device_id],
+                            "gueltig_bis": gueltig_bis_iso
                         }
                         if insert_point(neuer_punkt):
                             st.session_state.last_submit_ts = now
@@ -679,6 +847,8 @@ with tab_queue:
                         f"{kat_label} · Fortschritt: **{p['bestaetigungen']} / {min_confirmations} Bestätigungen** · "
                         f"Bewertung: {format_stars(get_avg_rating(p))} · Erfasst: {p['Erstellt am']}"
                     )
+                    if p.get("gueltig_bis_str"):
+                        st.caption(f"🕒 Zeitlich begrenzt bis: **{p['gueltig_bis_str']}**")
                     st.write(p["Beschreibung"])
                     if p.get("tags"):
                         st.caption("🏷️ " + ", ".join(p["tags"]))
@@ -729,9 +899,9 @@ with tab_about:
         Ziel ist es, sowohl dauerhafte Zugänge (Rampen, Aufzüge, ruhige Lernorte) als auch akute Hindernisse (defekte Aufzüge, Baustellen) in Echtzeit sichtbar zu machen.
 
         ### 🔒 Wie funktioniert die Qualitätssicherung & der Datenschutz?
-        * **Kein Account & keine persönlichen Daten nötig:** Du musst weder Namen noch E-Mail-Adresse angeben. Dein Browser speichert lediglich eine zufällige, anonyme Kennung (`localStorage`), damit jeder Punkt pro Gerät nur einmal bestätigt werden kann.
-        * **3-Augen-Prinzip:** Neue Meldungen starten in der Warteschlange und werden automatisch auf der Hauptkarte sichtbar, sobald **3 verschiedene Geräte** sie vor Ort bestätigt haben.
-        * **Offizielle Campus-Partner:** Verifizierte Stellen (z. B. AStA, Schwerbehindertenvertretung oder Projekt-Moderation) können gesicherte Hinweise direkt freischalten.
+- **Kein Account & keine persönlichen Daten nötig:** Du musst weder Namen noch E-Mail-Adresse angeben. Dein Browser speichert lediglich eine zufällige, anonyme Kennung (`localStorage`), damit jeder Punkt pro Gerät nur einmal bestätigt werden kann.
+- **3-Augen-Prinzip:** Neue Meldungen starten in der Warteschlange und werden automatisch auf der Hauptkarte sichtbar, sobald **3 verschiedene Geräte** sie vor Ort bestätigt haben.
+- **Offizielle Campus-Partner:** Verifizierte Stellen (z. B. AStA, Schwerbehindertenvertretung oder Projekt-Moderation) können gesicherte Hinweise direkt freischalten.
         """
     )
 
@@ -777,18 +947,20 @@ with tab_about:
                 st.session_state.is_admin = False
                 st.rerun()
 
-        if all_points:
+        if all_points_raw:
             st.markdown("#### 🛠️ Gespeicherte Einträge verwalten")
             admin_options = {
-                f"#{p['id']} · {p['Titel']} ({p['Status']} | {p['bestaetigungen']} Bestätigungen)": p
-                for p in all_points
+                f"#{p['id']} · {p['Titel']} ({p['Status']} | {p['bestaetigungen']} Bestätigungen"
+                + (" | ⌛ Abgelaufen)" if p.get("is_expired") else ")"): p
+                for p in all_points_raw
             }
             selected_label = st.selectbox("Eintrag auswählen:", options=list(admin_options.keys()))
             target_point = admin_options[selected_label]
 
+            valid_info = f" · Gültig bis: {target_point['gueltig_bis_str']}" if target_point.get("gueltig_bis_str") else ""
             st.caption(
                 f"Koordinaten: `{target_point['Breitengrad']}, {target_point['Längengrad']}` · "
-                f"Offiziell: {'Ja' if target_point.get('offiziell') else 'Nein'}"
+                f"Offiziell: {'Ja' if target_point.get('offiziell') else 'Nein'}{valid_info}"
             )
 
             col_a1, col_a2, col_a3 = st.columns([2, 1.5, 1.5])
