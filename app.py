@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_js_eval import get_geolocation
 import folium
 from streamlit_folium import st_folium
 
@@ -97,7 +98,7 @@ TU_CAMPUS_PINS = [
 ]
 
 # -----------------------------------------------------------------------------
-# Anonyme Geräte-ID & Browser-Standort (GPS)
+# Anonyme Geräte-ID über Browser-localStorage
 # -----------------------------------------------------------------------------
 def init_anonymous_device_id() -> str:
     """Erzeugt oder liest eine anonyme Geräte-ID aus dem Browser-localStorage."""
@@ -133,52 +134,6 @@ def init_anonymous_device_id() -> str:
         width=0
     )
     return st.session_state.device_id
-
-
-def sync_browser_gps_from_query():
-    """Übernimmt vom Browser übergebene GPS-Koordinaten aus den URL-Parametern."""
-    ulat = st.query_params.get("ulat")
-    ulon = st.query_params.get("ulon")
-    if ulat and ulon:
-        try:
-            lat_val = round(float(ulat), 6)
-            lon_val = round(float(ulon), 6)
-            if -90 <= lat_val <= 90 and -180 <= lon_val <= 180:
-                st.session_state.user_gps = (lat_val, lon_val)
-        except ValueError:
-            pass
-
-
-def trigger_browser_gps_request():
-    """Fragt einmalig die aktuelle Position über die Browser Geolocation API an."""
-    components.html(
-        """
-        <script>
-        (function() {
-            if (!navigator.geolocation) {
-                alert("Dein Browser unterstützt keine Standortabfrage.");
-                return;
-            }
-            navigator.geolocation.getCurrentPosition(
-                function(pos) {
-                    const lat = pos.coords.latitude.toFixed(6);
-                    const lon = pos.coords.longitude.toFixed(6);
-                    const url = new URL(window.parent.location.href);
-                    url.searchParams.set("ulat", lat);
-                    url.searchParams.set("ulon", lon);
-                    window.parent.location.href = url.toString();
-                },
-                function(err) {
-                    alert("Standort konnte nicht abgerufen werden. Bitte erlaube den Standortzugriff im Browser.");
-                },
-                { enableHighAccuracy: true, timeout: 10000 }
-            );
-        })();
-        </script>
-        """,
-        height=0,
-        width=0
-    )
 
 
 # -----------------------------------------------------------------------------
@@ -314,10 +269,8 @@ device_id = init_anonymous_device_id()
 if "user_gps" not in st.session_state:
     st.session_state.user_gps = None
 
-if "request_gps_now" not in st.session_state:
-    st.session_state.request_gps_now = False
-
-sync_browser_gps_from_query()
+if "gps_fetching" not in st.session_state:
+    st.session_state.gps_fetching = False
 
 if "selected_lat" not in st.session_state:
     st.session_state.selected_lat = BS_CENTER_LAT
@@ -349,8 +302,23 @@ if "last_submit_ts" not in st.session_state:
 if "feedback_banner" not in st.session_state:
     st.session_state.feedback_banner = None
 
+# Wenn GPS-Abfrage aktiv ist, über streamlit-js-eval Position holen
+if st.session_state.gps_fetching:
+    loc_data = get_geolocation(component_key="get_user_gps_location")
+    if loc_data and isinstance(loc_data, dict):
+        if "coords" in loc_data:
+            lat_val = round(float(loc_data["coords"]["latitude"]), 6)
+            lon_val = round(float(loc_data["coords"]["longitude"]), 6)
+            st.session_state.user_gps = (lat_val, lon_val)
+            st.session_state.map_center = [lat_val, lon_val]
+            st.session_state.map_zoom = 17
+            st.session_state.gps_fetching = False
+            st.rerun()
+        elif "error" in loc_data:
+            st.session_state.gps_fetching = False
+            st.warning("Standort konnte nicht abgerufen werden. Bitte erlaube den Standortzugriff im Browser.")
+
 all_points_raw = load_data()
-# Abgelaufene zeitlich begrenzte Einträge für die öffentliche Ansicht ausblenden
 active_points = [p for p in all_points_raw if not p.get("is_expired")]
 expired_points = [p for p in all_points_raw if p.get("is_expired")]
 
@@ -403,7 +371,7 @@ tab_map, tab_report, tab_queue, tab_about = st.tabs([
 # TAB 1: INTERAKTIVE KARTE & VERIFIZIERTE ORTE
 # =============================================================================
 with tab_map:
-    search_col, gps_col, toggle_col = st.columns([2.6, 1.2, 1.2])
+    search_col, gps_col, toggle_col = st.columns([2.6, 1.3, 1.1])
     with search_col:
         search_query = st.text_input(
             "Suche",
@@ -411,23 +379,20 @@ with tab_map:
             label_visibility="collapsed"
         )
     with gps_col:
-        if st.session_state.user_gps is None:
-            if st.button("📍 In meiner Nähe", use_container_width=True):
-                st.session_state.request_gps_now = True
+        if st.session_state.gps_fetching:
+            st.info("📡 Standort wird ermittelt...")
+        elif st.session_state.user_gps is None:
+            if st.button("📍 In meiner Nähe", type="primary", use_container_width=True):
+                st.session_state.gps_fetching = True
+                st.rerun()
         else:
-            if st.button("📍 Standort aktiv (Aus)", use_container_width=True):
+            if st.button("📍 Standort aktiv (Zurücksetzen)", use_container_width=True):
                 st.session_state.user_gps = None
-                if "ulat" in st.query_params:
-                    del st.query_params["ulat"]
-                if "ulon" in st.query_params:
-                    del st.query_params["ulon"]
+                st.session_state.map_center = [BS_CENTER_LAT, BS_CENTER_LON]
+                st.session_state.map_zoom = DEFAULT_ZOOM
                 st.rerun()
     with toggle_col:
         show_unverified_on_map = st.toggle("Unbestätigte grau", value=False)
-
-    if st.session_state.request_gps_now:
-        st.session_state.request_gps_now = False
-        trigger_browser_gps_request()
 
     with st.expander("🎛️ Filter nach Kategorie & Status anpassen", expanded=False):
         f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
@@ -461,7 +426,6 @@ with tab_map:
         )
     ]
 
-    # Entfernung berechnen & bei aktivem Standort nach Nähe sortieren
     if st.session_state.user_gps:
         u_lat, u_lon = st.session_state.user_gps
         for p in matching_points:
@@ -477,20 +441,23 @@ with tab_map:
 
     # Karte rendern (bei aktivem GPS auf Nutzerposition zentrieren)
     current_center = list(st.session_state.user_gps) if st.session_state.user_gps else st.session_state.map_center
+    current_zoom = 17 if st.session_state.user_gps else st.session_state.map_zoom
+
     m = folium.Map(
         location=current_center,
-        zoom_start=st.session_state.map_zoom,
+        zoom_start=current_zoom,
         tiles="OpenStreetMap"
     )
 
     if st.session_state.user_gps:
         folium.CircleMarker(
             location=list(st.session_state.user_gps),
-            radius=9,
+            radius=10,
             color="#0055FF",
             fill=True,
             fill_color="#3388FF",
             fill_opacity=0.9,
+            popup="<b>📍 Dein aktueller Standort</b>",
             tooltip="📍 Dein aktueller Standort"
         ).add_to(m)
 
@@ -555,11 +522,12 @@ with tab_map:
 
     folium.LayerControl().add_to(m)
 
+    map_key = f"inclusive_bs_main_map_{st.session_state.user_gps}"
     st_folium(
         m,
         width="100%",
         height=480,
-        key="inclusive_bs_main_map",
+        key=map_key,
         returned_objects=[]
     )
 
@@ -609,8 +577,7 @@ with tab_map:
 with tab_report:
     st.subheader("📍 Neuen Zugang, Ruheort oder Barriere melden")
     st.markdown(
-        "Wähle rechts ein **TU-Gebäude** aus oder klicke direkt auf die exakte Stelle auf der Karte – "
-        "fülle anschließend links das kurze Formular aus."
+        "Wähle rechts ein **TU-Gebäude** aus, nutze deinen aktuellen Standort oder klicke direkt auf die exakte Stelle auf der Karte."
     )
 
     form_col, picker_col = st.columns([1.2, 1])
@@ -628,10 +595,19 @@ with tab_report:
                 st.session_state.selected_location_label = f"{chosen_building['name']} ({chosen_building['adresse']})"
                 st.session_state.map_center = [chosen_building["lat"], chosen_building["lon"]]
 
+        if st.session_state.user_gps:
+            if st.button("📍 Meinen aktuellen GPS-Standort übernehmen", use_container_width=True):
+                u_lat, u_lon = st.session_state.user_gps
+                st.session_state.selected_lat = u_lat
+                st.session_state.selected_lon = u_lon
+                st.session_state.selected_location_label = f"Mein GPS-Standort ({u_lat:.5f}, {u_lon:.5f})"
+                st.session_state.map_center = [u_lat, u_lon]
+                st.rerun()
+
         st.info(f"📌 **Ausgewählter Standort:** {st.session_state.selected_location_label}")
 
         picker_map = folium.Map(
-            location=st.session_state.map_center,
+            location=[st.session_state.selected_lat, st.session_state.selected_lon],
             zoom_start=17,
             tiles="OpenStreetMap"
         )
@@ -682,7 +658,6 @@ with tab_report:
             )
             status = st.selectbox("Aktueller Status *", options=STATUS_OPTIONEN)
 
-            # Zeitliche Begrenzung (ideal für kurzfristig freie Räume oder Baustellen)
             is_time_limited = st.checkbox(
                 "🕒 Zeitlich begrenzt (z. B. Raum nur heute bis zu einer bestimmten Uhrzeit frei)",
                 value=False
